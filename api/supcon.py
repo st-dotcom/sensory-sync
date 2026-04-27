@@ -1,103 +1,64 @@
-from typing import Optional, Tuple
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
 import numpy as np
+from sklearn.decomposition import PCA
+from typing import List, Dict, Any
 
-class ProjectionHead(nn.Module):
-    def __init__(self, input_dim: int = 768, hidden_dim: int = 256, output_dim: int = 128):
-        super(ProjectionHead, self).__init__()
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, output_dim)
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return F.normalize(self.net(x), dim=1)
-
-def save_model(model: nn.Module, path: str):
-    """モデルの保存"""
-    try:
-        torch.save(model.state_dict(), path)
-    except Exception as e:
-        print(f"Error saving model: {e}")
-
-def load_model(model: nn.Module, path: str) -> bool:
-    """モデルの読み込み"""
-    if not os.path.exists(path):
-        return False
-    try:
-        model.load_state_dict(torch.load(path))
-        return True
-    except Exception as e:
-        print(f"Error loading model: {e}")
-        return False
-
-def supcon_loss(features: torch.Tensor, labels: torch.Tensor, temperature: float = 0.07) -> torch.Tensor:
+def train_supcon(embeddings: np.ndarray, labels: np.ndarray, epochs: int = 50, lr: float = 0.01) -> np.ndarray:
     """
-    Supervised Contrastive Learning Loss.
-    """
-    device = features.device
-    batch_size = features.shape[0]
-    
-    # Compute similarity matrix
-    logits = torch.div(torch.matmul(features, features.T), temperature)
-    
-    # For numerical stability
-    logits_max, _ = torch.max(logits, dim=1, keepdim=True)
-    logits = logits - logits_max.detach()
-    
-    # Create positive mask
-    labels = labels.contiguous().view(-1, 1)
-    mask = torch.eq(labels, labels.T).float().to(device)
-    
-    # Mask out self-similarity
-    logits_mask = torch.scatter(
-        torch.ones_like(mask),
-        1,
-        torch.arange(batch_size).view(-1, 1).to(device),
-        0
-    )
-    mask = mask * logits_mask
-    
-    # Compute log_prob
-    exp_logits = torch.exp(logits) * logits_mask
-    log_prob = logits - torch.log(exp_logits.sum(1, keepdim=True) + 1e-6)
-    
-    # Compute mean of log-likelihood over positive pairs
-    denominator = mask.sum(1)
-    # 0除算を避ける
-    mask_sum = torch.where(denominator > 0, denominator, torch.ones_like(denominator))
-    mean_log_prob_pos = (mask * log_prob).sum(1) / mask_sum
-    
-    loss = -mean_log_prob_pos[denominator > 0].mean()
-    return loss if not torch.isnan(loss) else torch.tensor(0.0)
-
-def train_supcon(embeddings: np.ndarray, labels: np.ndarray, epochs: int = 50, lr: float = 0.001) -> np.ndarray:
-    """
-    軽量なSupCon学習ループ
+    NumPyによる超軽量SupCon実装（投影ヘッドの学習）
+    Vercelのサイズ制限を回避するため、Torchの代わりにPure NumPyで動作します。
     """
     if len(embeddings) < 2:
-        return embeddings # もしデータが少なすぎる場合はそのまま返す
+        return embeddings
 
-    input_dim = embeddings.shape[1]
-    model = ProjectionHead(input_dim=input_dim)
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    N, D = embeddings.shape
+    hidden_dim = 128
+    output_dim = 64
     
-    x = torch.from_numpy(embeddings).float()
-    y = torch.from_numpy(labels).long()
+    # 重みの初期化 (簡易的な2層MLP)
+    # 乱数のシードを固定して再現性を確保
+    np.random.seed(42)
+    W1 = np.random.randn(D, hidden_dim) * 0.01
+    W2 = np.random.randn(hidden_dim, output_dim) * 0.01
+
+    # 軽量な学習ループ (勾配降下法)
+    for _ in range(epochs):
+        # Forward pass
+        # ReLU活性化関数
+        h = np.maximum(0, embeddings @ W1) 
+        z = h @ W2
+        # L2正規化 (特徴量を単位球上に投影)
+        z_norm = np.linalg.norm(z, axis=1, keepdims=True)
+        z = z / (z_norm + 1e-8)
+        
+        # 簡易的な対照学習の更新
+        # 正例（同じラベル）を近づけ、負例を遠ざける
+        for i in range(N):
+            pos_mask = (labels == labels[i])
+            pos_mask[i] = False # 自分自身を除外
+            
+            if not np.any(pos_mask):
+                continue
+            
+            # 簡略化した勾配: (正例との平均差) - (全体の平均との差)
+            # これにより、同じラベルのクラスターを形成しつつ分散を維持する
+            grad_z = -np.mean(z[pos_mask] - z[i], axis=0) * 0.1
+            grad_z += (z[i] - np.mean(z, axis=0)) * 0.05
+            
+            # Backpropagation (簡易版)
+            # z = h * W2 -> dz/dW2 = h
+            delta_W2 = h[i:i+1].T @ grad_z.reshape(1, -1)
+            W2 -= lr * delta_W2
+            
+            # h = embeddings * W1 -> dh/dW1 = embeddings (if h > 0)
+            if np.any(h[i] > 0):
+                grad_h = grad_z @ W2.T
+                grad_h[h[i] <= 0] = 0 # ReLU gradient
+                delta_W1 = embeddings[i:i+1].T @ grad_h.reshape(1, -1)
+                W1 -= lr * delta_W1
+            
+    # 学習後の最終的な特徴量を計算
+    final_h = np.maximum(0, embeddings @ W1)
+    final_z = final_h @ W2
+    final_z = final_z / (np.linalg.norm(final_z, axis=1, keepdims=True) + 1e-8)
     
-    model.train()
-    for epoch in range(epochs):
-        optimizer.zero_grad()
-        features = model(x)
-        loss = supcon_loss(features, y)
-        loss.backward()
-        optimizer.step()
-        
-    model.eval()
-    with torch.no_grad():
-        projected_vectors = model(x).detach().cpu().numpy()
-        
-    return projected_vectors
+    return final_z
