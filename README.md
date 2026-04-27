@@ -4,9 +4,6 @@
 
 SensorySyncは、Google Gemini APIによる高度な画像解析と、Supervised Contrastive Learning (SupCon) を組み合わせた、クリエイティブな画像マッピング・プラットフォームです。アップロードされた画像の「本質（Essence）」を抽出し、感性的な類似性に基づいてベクトル空間を動的に再構築します。
 
-![SensorySync Hero Concept](public/hero-placeholder.png)
-*(ここにアプリのメイン画面のGIFまたはスタイリッシュな画像を配置)*
-
 ## 主な機能
 
 - **Gemini Essence Extraction**: `gemini-1.5-flash` を使用し、画像からタグ、説明文、支配的なカラーを抽出。
